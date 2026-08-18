@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+
+# Poetry
+poetry.lock
+
+# Project artifacts
+checkpoints/
+games/
+*.pt
+*.pkl

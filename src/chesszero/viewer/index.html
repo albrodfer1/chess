@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ChessZero — Game Viewer</title>
+<style>
+  :root {
+    --bg: #1e1f26; --panel: #2a2c37; --text: #e6e6ea; --muted: #9aa0b4;
+    --light: #eae0c8; --dark: #6f8b6a; --accent: #f0b429; --hl: #b8d24a88;
+    --bar: #4b9fe1; --bar-visits: #6f8b6a; --played: #f0b429;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+    background: var(--bg); color: var(--text);
+  }
+  header {
+    padding: 12px 20px; background: var(--panel);
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    border-bottom: 1px solid #000;
+  }
+  header h1 { font-size: 18px; margin: 0; color: var(--accent); }
+  select, button {
+    background: #3a3d4a; color: var(--text); border: 1px solid #4a4d5a;
+    border-radius: 6px; padding: 6px 10px; font-size: 14px; cursor: pointer;
+  }
+  button:hover { background: #464a58; }
+  main { display: flex; gap: 24px; padding: 20px; flex-wrap: wrap; }
+  .board-col { display: flex; flex-direction: column; gap: 12px; }
+  #board {
+    width: 480px; height: 480px; display: grid;
+    grid-template-columns: repeat(8, 1fr); grid-template-rows: repeat(8, 1fr);
+    border: 3px solid #000; border-radius: 4px; overflow: hidden;
+  }
+  .sq {
+    display: flex; align-items: center; justify-content: center;
+    font-size: 44px; line-height: 1; position: relative; user-select: none;
+  }
+  .sq.light { background: var(--light); }
+  .sq.dark { background: var(--dark); }
+  .sq .piece { color: #111; text-shadow: 0 1px 0 #fff6; }
+  .sq.hl::after {
+    content: ""; position: absolute; inset: 0; background: var(--hl);
+  }
+  .coord { position: absolute; font-size: 10px; color: #0007; }
+  .coord.file { right: 2px; bottom: 1px; }
+  .coord.rank { left: 2px; top: 1px; }
+  .controls { display: flex; align-items: center; gap: 8px; }
+  .controls button { min-width: 42px; }
+  #slider { flex: 1; }
+  .panel {
+    background: var(--panel); border-radius: 10px; padding: 16px;
+    width: 420px; min-width: 320px; flex: 1;
+  }
+  .row { display: flex; justify-content: space-between; margin-bottom: 6px; }
+  .muted { color: var(--muted); }
+  .value-gauge {
+    height: 16px; background: #3a3d4a; border-radius: 8px; position: relative;
+    margin: 6px 0 16px; overflow: hidden;
+  }
+  .value-gauge .mid { position: absolute; left: 50%; top: 0; bottom: 0; width: 1px; background: #fff4; }
+  .value-gauge .fill { position: absolute; top: 0; bottom: 0; background: var(--accent); }
+  h3 { margin: 14px 0 8px; font-size: 14px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+  .eval { margin-bottom: 7px; }
+  .eval-head { display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 2px; }
+  .eval-head .san { font-weight: 600; }
+  .eval.played .san { color: var(--played); }
+  .bars { position: relative; height: 14px; background: #3a3d4a; border-radius: 4px; overflow: hidden; }
+  .bar-policy { position: absolute; left: 0; top: 0; height: 8px; background: var(--bar); }
+  .bar-visits { position: absolute; left: 0; bottom: 0; height: 5px; background: var(--bar-visits); opacity: .85; }
+  .legend { font-size: 12px; color: var(--muted); display: flex; gap: 16px; margin-top: 4px; }
+  .legend span::before { content: "■ "; }
+  .legend .p::before { color: var(--bar); }
+  .legend .v::before { color: var(--bar-visits); }
+  .empty { color: var(--muted); padding: 40px; text-align: center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>♟ ChessZero — Game Viewer</h1>
+  <label>Game: <select id="gameSelect"></select></label>
+  <span id="gameMeta" class="muted"></span>
+</header>
+
+<main id="app">
+  <div class="board-col">
+    <div id="board"></div>
+    <div class="controls">
+      <button id="first">⏮</button>
+      <button id="prev">◀</button>
+      <button id="play">▶ Play</button>
+      <button id="next">▶</button>
+      <button id="last">⏭</button>
+    </div>
+    <div class="controls">
+      <input type="range" id="slider" min="0" value="0" />
+      <span id="plyLabel" class="muted"></span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="row"><span class="muted">To move</span><span id="turn"></span></div>
+    <div class="row"><span class="muted">Move played</span><span id="played"></span></div>
+    <div class="row"><span class="muted">Value (network / MCTS)</span><span id="valText"></span></div>
+    <div class="value-gauge"><div class="mid"></div><div class="fill" id="valFill"></div></div>
+
+    <h3>Move evaluation (policy softmax)</h3>
+    <div id="evals"></div>
+    <div class="legend"><span class="p">policy (network softmax)</span><span class="v">visits (MCTS)</span></div>
+  </div>
+</main>
+
+<script>
+const GLYPH = {K:"♔",Q:"♕",R:"♖",B:"♗",N:"♘",P:"♙",k:"♚",q:"♛",r:"♜",b:"♝",n:"♞",p:"♟"};
+let game = null, ply = 0, playTimer = null;
+
+function renderBoard(fen, playedUci) {
+  const board = document.getElementById("board");
+  board.innerHTML = "";
+  const placement = fen.split(" ")[0];
+  const ranks = placement.split("/");   // index 0 = rank 8 (top)
+  const fromSq = playedUci ? playedUci.slice(0, 2) : null;
+  const toSq = playedUci ? playedUci.slice(2, 4) : null;
+
+  for (let r = 0; r < 8; r++) {
+    // Expand the rank string (digits = runs of empty squares) into 8 cells.
+    const cells = [];
+    for (const ch of ranks[r]) {
+      if (/\d/.test(ch)) { for (let k = 0; k < parseInt(ch, 10); k++) cells.push(""); }
+      else cells.push(ch);
+    }
+    for (let file = 0; file < 8; file++) {
+      const ch = cells[file];
+      const rankNum = 8 - r;                       // 8..1
+      const fileLetter = "abcdefgh"[file];
+      const name = fileLetter + rankNum;
+      const sq = document.createElement("div");
+      const isLight = (file + rankNum) % 2 === 1;  // a1 dark
+      sq.className = "sq " + (isLight ? "light" : "dark");
+      if (name === fromSq || name === toSq) sq.classList.add("hl");
+      if (ch) {
+        const piece = document.createElement("span");
+        piece.className = "piece";
+        piece.textContent = GLYPH[ch] || "";
+        sq.appendChild(piece);
+      }
+      if (rankNum === 1) sq.insertAdjacentHTML("beforeend", `<span class="coord file">${fileLetter}</span>`);
+      if (file === 0) sq.insertAdjacentHTML("beforeend", `<span class="coord rank">${rankNum}</span>`);
+      board.appendChild(sq);
+    }
+  }
+}
+
+function fmtVal(v) { return v === null || v === undefined ? "—" : (v >= 0 ? "+" : "") + v.toFixed(3); }
+
+function renderPly() {
+  const m = game.moves[ply];
+  renderBoard(m.fen, m.played ? m.played.uci : null);
+
+  document.getElementById("turn").textContent = m.turn;
+  document.getElementById("played").textContent = m.played ? m.played.san : "— (final)";
+  document.getElementById("valText").textContent =
+    m.terminal ? "—" : `${fmtVal(m.value)} / ${fmtVal(m.mcts_value)}`;
+
+  // value gauge: side-to-move perspective, [-1,1] -> [0,100]%
+  const v = m.terminal ? 0 : (m.mcts_value ?? m.value ?? 0);
+  const fill = document.getElementById("valFill");
+  const pct = Math.abs(v) * 50;
+  fill.style.left = v >= 0 ? "50%" : (50 - pct) + "%";
+  fill.style.width = pct + "%";
+
+  // evaluation bars
+  const evalsEl = document.getElementById("evals");
+  evalsEl.innerHTML = "";
+  if (!m.evaluations || m.evaluations.length === 0) {
+    evalsEl.innerHTML = '<div class="empty">No evaluation (terminal position).</div>';
+  } else {
+    const maxP = Math.max(...m.evaluations.map(e => e.policy), 0.0001);
+    for (const e of m.evaluations) {
+      const played = m.played && e.uci === m.played.uci;
+      const div = document.createElement("div");
+      div.className = "eval" + (played ? " played" : "");
+      div.innerHTML =
+        `<div class="eval-head"><span class="san">${e.san}${played ? " ✓" : ""}</span>` +
+        `<span class="muted">${(e.policy * 100).toFixed(1)}% · v ${(e.visits * 100).toFixed(0)}%</span></div>` +
+        `<div class="bars"><div class="bar-policy" style="width:${(e.policy / maxP) * 100}%"></div>` +
+        `<div class="bar-visits" style="width:${e.visits * 100}%"></div></div>`;
+      evalsEl.appendChild(div);
+    }
+  }
+
+  document.getElementById("slider").value = ply;
+  document.getElementById("plyLabel").textContent =
+    `ply ${ply} / ${game.moves.length - 1}`;
+}
+
+function goTo(p) {
+  ply = Math.max(0, Math.min(game.moves.length - 1, p));
+  renderPly();
+}
+
+function stopPlay() {
+  if (playTimer) { clearInterval(playTimer); playTimer = null; }
+  document.getElementById("play").textContent = "▶ Play";
+}
+
+function togglePlay() {
+  if (playTimer) { stopPlay(); return; }
+  document.getElementById("play").textContent = "⏸ Pause";
+  playTimer = setInterval(() => {
+    if (ply >= game.moves.length - 1) { stopPlay(); return; }
+    goTo(ply + 1);
+  }, 700);
+}
+
+async function loadGame(file) {
+  stopPlay();
+  const res = await fetch(file);
+  game = await res.json();
+  document.getElementById("slider").max = game.moves.length - 1;
+  const meta = `iter ${game.iteration ?? "?"} · result ${game.result_str ?? game.result} · ${game.termination ?? ""}`;
+  document.getElementById("gameMeta").textContent = meta;
+  goTo(0);
+}
+
+async function init() {
+  const manifest = await (await fetch("manifest.json")).json();
+  const sel = document.getElementById("gameSelect");
+  if (manifest.length === 0) {
+    document.getElementById("app").innerHTML =
+      '<div class="empty">No games found. Train with <code>--sample-games</code> to produce some.</div>';
+    return;
+  }
+  manifest.forEach((g, i) => {
+    const opt = document.createElement("option");
+    opt.value = g.file;
+    opt.textContent = `#${g.game_index ?? i} · iter ${g.iteration ?? "?"} · ${g.result ?? ""} (${g.num_plies} plies)`;
+    sel.appendChild(opt);
+  });
+  sel.addEventListener("change", () => loadGame(sel.value));
+
+  document.getElementById("first").onclick = () => { stopPlay(); goTo(0); };
+  document.getElementById("prev").onclick = () => { stopPlay(); goTo(ply - 1); };
+  document.getElementById("next").onclick = () => { stopPlay(); goTo(ply + 1); };
+  document.getElementById("last").onclick = () => { stopPlay(); goTo(game.moves.length - 1); };
+  document.getElementById("play").onclick = togglePlay;
+  document.getElementById("slider").addEventListener("input", (e) => { stopPlay(); goTo(+e.target.value); });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "ArrowRight") { stopPlay(); goTo(ply + 1); }
+    else if (e.key === "ArrowLeft") { stopPlay(); goTo(ply - 1); }
+    else if (e.key === " ") { e.preventDefault(); togglePlay(); }
+  });
+
+  await loadGame(manifest[0].file);
+}
+
+init();
+</script>
+</body>
+</html>
