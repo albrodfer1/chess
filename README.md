@@ -1,5 +1,7 @@
 # ChessZero
 
+> Disclaimer: The code and documents of this project are AI-Generated
+
 An AlphaZero-style reinforcement-learning chess agent. The model learns to play
 purely from **self-play**, guided by **Monte Carlo Tree Search (MCTS)**, and it
 is structurally incapable of selecting an **illegal move**.
