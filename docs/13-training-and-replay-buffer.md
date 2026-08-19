@@ -69,6 +69,11 @@ automatically. So the buffer always holds roughly the last `replay_buffer_size`
 positions the agent generated — a mix of games from the last several iterations,
 not just the most recent one.
 
+> **Are examples guaranteed to be trained on before eviction?**
+> Yes. In the reinforcement loop ([Chapter 14](14-the-reinforcement-loop.md)), self-play and training alternate in strict lockstep. Each iteration generates only `games_per_iteration = 20` games (~1,200 examples), immediately followed by `train_epochs`. Because $1{,}200 \ll 50{,}000$, every single generated example is guaranteed to enter the buffer and be trained on across ~40 subsequent iterations before it is eventually pushed off the left end.
+>
+> Furthermore, while the buffer holds at most 50,000 examples in RAM at any given moment, the model accumulates knowledge in its weights across all iterations, allowing the network to train on millions of cumulative examples over the course of a full run.
+
 ### Why bother? Three reasons
 
 The buffer is not just a container; it is a training-stability tool
