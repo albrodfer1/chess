@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import time
+from dataclasses import asdict
 from pathlib import Path
 
 import chess
@@ -42,6 +44,35 @@ def _evenly_spaced_indices(total: int, count: int) -> set[int]:
     return {round(i * (total - 1) / (count - 1)) for i in range(count)}
 
 
+def _git(*args: str) -> str:
+    """Run a git command from the repo and return its stripped stdout."""
+    try:
+        return subprocess.check_output(
+            ["git", *args], text=True, stderr=subprocess.DEVNULL
+        ).strip()
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        raise SystemExit(
+            "git is required to train (runs are namespaced by commit hash), "
+            f"but `git {' '.join(args)}` failed: {exc}"
+        ) from exc
+
+
+def _require_clean_worktree() -> str:
+    """Return the current short commit hash, refusing to run if the tree is dirty.
+
+    Training is namespaced by commit so a run is reproducible from its hash;
+    uncommitted changes would make that hash a lie. Gitignored artifacts (the
+    checkpoint/game output dirs) don't show up here, so they don't block a run.
+    """
+    dirty = _git("status", "--porcelain")
+    if dirty:
+        raise SystemExit(
+            "Refusing to train with uncommitted changes — commit or stash them "
+            "so the run is reproducible from its git hash.\n" + dirty
+        )
+    return _git("rev-parse", "--short", "HEAD")
+
+
 def _save_game(games_dir: Path, global_index: int, iteration: int,
                record: dict) -> Path:
     games_dir.mkdir(parents=True, exist_ok=True)
@@ -61,10 +92,13 @@ def cmd_loop(args: argparse.Namespace) -> None:
     if args.iterations:
         config.iterations = args.iterations
 
-    print(f"Device: {config.device} | sims/move: {config.num_simulations} "
-          f"| games/iter: {config.games_per_iteration}")
+    # Reproducibility: refuse to train on a dirty tree, and namespace every
+    # artifact of this run by the commit it was trained at.
+    git_hash = _require_clean_worktree()
 
-    ckpt_dir = Path(config.checkpoint_dir)
+    print(f"Device: {config.device} | sims/move: {config.num_simulations} "
+          f"| games/iter: {config.games_per_iteration} | git: {git_hash}")
+
     net, optimizer = _build(config)
     buffer = ReplayBuffer(config.replay_buffer_size)
     start_iter = 0
@@ -79,10 +113,19 @@ def cmd_loop(args: argparse.Namespace) -> None:
         start_iter = payload.get("iteration", 0)
         print(f"Resumed from {args.resume} at iteration {start_iter}")
 
+    # Per-commit output folders + a config.json recording exactly what we ran.
+    ckpt_dir = Path(config.checkpoint_dir) / git_hash
+    games_dir = Path(args.games_dir) / git_hash
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    config_path = ckpt_dir / "config.json"
+    config_path.write_text(
+        json.dumps({"git_hash": git_hash, **asdict(config)}, indent=2)
+    )
+    print(f"Run dir: {ckpt_dir}/ (config -> {config_path})")
+
     # Decide which games to record, spread evenly across the whole run.
     total_games = config.iterations * config.games_per_iteration
     sample_set = _evenly_spaced_indices(total_games, args.sample_games)
-    games_dir = Path(args.games_dir)
     if sample_set:
         print(f"Sampling {len(sample_set)} game(s) sparsely across {total_games} "
               f"to '{games_dir}/' for the viewer")
@@ -94,20 +137,32 @@ def cmd_loop(args: argparse.Namespace) -> None:
         net.eval()
         evaluator = Evaluator(net, config.device)
         new_examples = 0
+        outcomes = {"white wins": 0, "black wins": 0, "draw": 0}
+        reasons: dict[str, int] = {}
         for g in range(config.games_per_iteration):
-            if global_index in sample_set:
-                examples, record = play_game(evaluator, config, record=True)
-                path = _save_game(games_dir, global_index, iteration + 1, record)
-                print(f"  [iter {iteration}] self-play game {g + 1}/"
-                      f"{config.games_per_iteration}: {len(examples)} positions "
-                      f"(saved -> {path})", flush=True)
-            else:
-                examples = play_game(evaluator, config)
-                print(f"  [iter {iteration}] self-play game {g + 1}/"
-                      f"{config.games_per_iteration}: {len(examples)} positions", flush=True)
+            record_this = global_index in sample_set
+            examples, info = play_game(evaluator, config, record=record_this)
+
+            outcomes[info["winner"]] += 1
+            reasons[info["termination"]] = reasons.get(info["termination"], 0) + 1
+
+            line = (f"  [iter {iteration}] self-play game {g + 1}/"
+                    f"{config.games_per_iteration}: {len(examples)} positions "
+                    f"| {info['winner']} ({info['termination']}) "
+                    f"in {info['num_plies']} plies")
+            if record_this:
+                path = _save_game(games_dir, global_index, iteration + 1, info)
+                line += f" (saved -> {path})"
+            print(line, flush=True)
+
             buffer.add(examples)
             new_examples += len(examples)
             global_index += 1
+
+        reason_str = ", ".join(f"{n} {r}" for r, n in sorted(reasons.items()))
+        print(f"  [iter {iteration}] results: "
+              f"W {outcomes['white wins']} / B {outcomes['black wins']} / "
+              f"D {outcomes['draw']}  ({reason_str})", flush=True)
 
         stats = train_epochs(net, buffer, optimizer, config)
 

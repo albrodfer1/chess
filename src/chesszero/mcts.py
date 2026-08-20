@@ -71,10 +71,22 @@ class Node:
         return self.value_sum / self.visit_count
 
 
+def is_terminal(board: chess.Board) -> bool:
+    """Whether the game is over, treating a threefold repetition as a draw.
+
+    ``board.is_game_over()`` only ends on *automatic* draws (fivefold, the
+    75-move rule, stalemate, ...); a threefold repetition is merely claimable
+    and would otherwise let games shuffle on until fivefold. We adjudicate it as
+    a draw so games actually end by repetition.
+    """
+    return board.is_game_over() or board.is_repetition(3)
+
+
 def terminal_value(board: chess.Board) -> float:
     """Game result from the perspective of the side to move at `board`."""
     outcome = board.outcome()
     if outcome is None or outcome.winner is None:
+        # None covers a threefold repetition (a draw under is_terminal).
         return 0.0
     # If it's a win, the side to move can't be the winner (they were mated).
     return 1.0 if outcome.winner == board.turn else -1.0
@@ -136,7 +148,7 @@ def run_mcts(board: chess.Board, evaluator: Evaluator, config: Config,
             node.board = node.parent.board.copy()
             node.board.push(node.move)
 
-        if node.board.is_game_over():
+        if is_terminal(node.board):
             value = terminal_value(node.board)
         else:
             priors, value = evaluator.evaluate(node.board)

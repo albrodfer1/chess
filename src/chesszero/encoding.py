@@ -1,7 +1,7 @@
 """Encoding between python-chess objects and neural-network tensors.
 
 This implements the AlphaZero action representation: an 8x8x73 = 4672 flat
-action space, plus a 19-plane board encoding. It also exposes the legal-move
+action space, plus a 21-plane board encoding. It also exposes the legal-move
 mask that guarantees the agent can never *select* an illegal move.
 """
 
@@ -20,7 +20,13 @@ import numpy as np
 #   13-16 : castling rights (W kingside, W queenside, B kingside, B queenside)
 #   17    : en-passant target square
 #   18    : halfmove clock, normalized by 100
-INPUT_PLANES = 19
+#   19    : repetition — current position has occurred at least twice
+#   20    : repetition — current position has occurred at least three times
+#
+# The two repetition planes give the network the history it needs to see a
+# threefold-repetition draw coming: without them a single-position encoding is
+# blind to how many times the position has already appeared in the game.
+INPUT_PLANES = 21
 
 # Action space: 73 move "planes" per from-square, 64 from-squares.
 QUEEN_DIRECTIONS = [
@@ -52,7 +58,7 @@ def _piece_plane(color: bool, piece_type: int) -> int:
 
 
 def encode_board(board: chess.Board) -> np.ndarray:
-    """Encode a board into a (19, 8, 8) float32 tensor (absolute coordinates)."""
+    """Encode a board into a (21, 8, 8) float32 tensor (absolute coordinates)."""
     planes = np.zeros((INPUT_PLANES, 8, 8), dtype=np.float32)
 
     for square, piece in board.piece_map().items():
@@ -72,6 +78,14 @@ def encode_board(board: chess.Board) -> np.ndarray:
         planes[17, rank, file] = 1.0
 
     planes[18, :, :] = board.halfmove_clock / 100.0
+
+    # Repetition counting needs the move stack; boards built by pushing moves
+    # (self-play and MCTS copies, which keep their history) carry it, so
+    # is_repetition is meaningful here.
+    if board.is_repetition(2):
+        planes[19, :, :] = 1.0
+    if board.is_repetition(3):
+        planes[20, :, :] = 1.0
     return planes
 
 

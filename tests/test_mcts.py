@@ -3,7 +3,7 @@
 import chess
 
 from chesszero.config import Config
-from chesszero.mcts import Evaluator, run_mcts, select_move
+from chesszero.mcts import Evaluator, is_terminal, run_mcts, select_move
 from chesszero.network import ChessNet
 from chesszero.selfplay import play_game
 
@@ -33,15 +33,31 @@ def test_mcts_returns_legal_move():
     assert move in board.legal_moves
 
 
+def test_threefold_repetition_is_terminal():
+    board = chess.Board()
+    # Shuffle both knights out and back: each full cycle repeats the position.
+    cycle = ["g1f3", "g8f6", "f3g1", "f6g8"]
+    for move in cycle * 2:
+        assert not is_terminal(board)  # not yet a threefold
+        board.push_uci(move)
+    # The starting position has now occurred three times.
+    assert board.is_repetition(3)
+    assert is_terminal(board)
+    # A plain is_game_over() would miss it (threefold is only claimable).
+    assert not board.is_game_over()
+
+
 def test_self_play_produces_labelled_examples():
     config = _tiny_config()
     net = ChessNet(config)
     net.eval()
     evaluator = Evaluator(net, "cpu")
 
-    examples = play_game(evaluator, config)
+    examples, info = play_game(evaluator, config)
     assert len(examples) > 0
+    assert info["winner"] in {"white wins", "black wins", "draw"}
+    assert info["termination"]  # a non-empty reason string
     for ex in examples:
-        assert ex.state.shape == (19, 8, 8)
+        assert ex.state.shape == (config.input_planes, 8, 8)
         assert ex.policy.shape == (config.action_size,)
         assert -1.0 <= ex.value <= 1.0

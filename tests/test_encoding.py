@@ -4,6 +4,7 @@ import chess
 
 from chesszero.encoding import (
     ACTION_SIZE,
+    INPUT_PLANES,
     encode_board,
     index_to_move,
     legal_mask,
@@ -18,8 +19,29 @@ def test_action_size():
 def test_encode_shape_and_side_to_move():
     board = chess.Board()
     planes = encode_board(board)
-    assert planes.shape == (19, 8, 8)
+    assert planes.shape == (INPUT_PLANES, 8, 8)
     assert planes[12].all()  # white to move at the start
+
+
+def test_repetition_planes():
+    board = chess.Board()
+    # No repetition yet: both repetition planes are empty.
+    planes = encode_board(board)
+    assert not planes[19].any()
+    assert not planes[20].any()
+
+    cycle = ["g1f3", "g8f6", "f3g1", "f6g8"]
+    for move in cycle:  # one cycle -> starting position seen twice
+        board.push_uci(move)
+    planes = encode_board(board)
+    assert planes[19].all()       # two-fold: the one-step draw warning
+    assert not planes[20].any()   # not yet three-fold
+
+    for move in cycle:  # second cycle -> seen three times
+        board.push_uci(move)
+    planes = encode_board(board)
+    assert planes[19].all()
+    assert planes[20].all()       # three-fold
 
 
 def test_move_index_roundtrip_all_legal():

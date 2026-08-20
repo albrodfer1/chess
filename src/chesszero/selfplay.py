@@ -6,7 +6,7 @@ import chess
 
 from .config import Config
 from .encoding import encode_board
-from .mcts import Evaluator, policy_from_visits, run_mcts, select_move
+from .mcts import Evaluator, is_terminal, policy_from_visits, run_mcts, select_move
 from .replay_buffer import Example
 
 
@@ -18,17 +18,22 @@ def play_game(evaluator: Evaluator, config: Config, record: bool = False):
     for exploration, greedy later). When the game ends, every stored position is
     labelled with the final result relative to its mover.
 
-    If ``record`` is True, returns ``(examples, game_record)`` where
-    ``game_record`` is a JSON-serializable dict with per-ply data (FEN, the move
-    played, the network value, and the softmax evaluation of every legal move)
-    suitable for the browser viewer. Otherwise returns just ``examples``.
+    Always returns ``(examples, info)``. ``info`` is a JSON-serializable summary
+    of the finished game: ``result`` (+1/0/-1, white's perspective), ``winner``
+    ("white wins"/"black wins"/"draw"), ``result_str`` ("1-0"/"0-1"/"1/2-1/2"),
+    ``num_plies`` and ``termination`` (the reason the game ended: "checkmate",
+    "threefold repetition", "fivefold repetition", "max moves", ...).
+
+    If ``record`` is True, ``info`` additionally carries a ``moves`` list with
+    per-ply data (FEN, the move played, the network value, and the softmax
+    evaluation of every legal move) suitable for the browser viewer.
     """
     board = chess.Board()
     history: list[tuple] = []  # (state, policy, side_to_move)
     ply_records: list[dict] = []
 
     move_number = 0
-    while not board.is_game_over() and move_number < config.max_moves:
+    while not is_terminal(board) and move_number < config.max_moves:
         root = run_mcts(board, evaluator, config, add_noise=True)
         if not root.children:
             break
@@ -52,8 +57,16 @@ def play_game(evaluator: Evaluator, config: Config, record: bool = False):
         value = result if side_to_move == chess.WHITE else -result
         examples.append(Example(state=state, policy=policy, value=float(value)))
 
+    info = {
+        "result": result,                 # +1 / 0 / -1 (white perspective)
+        "winner": _winner_str(result),
+        "result_str": board.result(claim_draw=True),
+        "num_plies": move_number,
+        "termination": _termination_reason(board, move_number, config),
+    }
+
     if not record:
-        return examples
+        return examples, info
 
     # Append the final position so the viewer can show the finished board.
     ply_records.append({
@@ -67,14 +80,8 @@ def play_game(evaluator: Evaluator, config: Config, record: bool = False):
         "terminal": True,
     })
 
-    game_record = {
-        "result": result,                 # +1 / 0 / -1 (white perspective)
-        "result_str": board.result(claim_draw=True),
-        "num_plies": move_number,
-        "termination": _termination_str(board),
-        "moves": ply_records,
-    }
-    return examples, game_record
+    info["moves"] = ply_records
+    return examples, info
 
 
 def _record_ply(board: chess.Board, root, move: chess.Move,
@@ -111,11 +118,36 @@ def _record_ply(board: chess.Board, root, move: chess.Move,
     }
 
 
-def _termination_str(board: chess.Board) -> str:
-    outcome = board.outcome(claim_draw=True)
-    if outcome is None:
-        return "move-limit"
-    return outcome.termination.name.lower()
+def _winner_str(result: float) -> str:
+    if result > 0:
+        return "white wins"
+    if result < 0:
+        return "black wins"
+    return "draw"
+
+
+def _termination_reason(board: chess.Board, move_number: int, config: Config) -> str:
+    """Why the game ended, based on the final board (not a claim look-ahead).
+
+    If the position isn't terminal under our rules, the loop can only have
+    stopped by hitting the move cap. Otherwise we report the specific rule,
+    checking fivefold before threefold since fivefold implies threefold.
+    """
+    if not is_terminal(board):
+        return "max moves"
+    if board.is_checkmate():
+        return "checkmate"
+    if board.is_stalemate():
+        return "stalemate"
+    if board.is_insufficient_material():
+        return "insufficient material"
+    if board.is_fivefold_repetition():
+        return "fivefold repetition"
+    if board.is_repetition(3):
+        return "threefold repetition"
+    if board.is_seventyfive_moves():
+        return "seventy-five-move rule"
+    return "unknown"
 
 
 def _game_result(board: chess.Board) -> float:
