@@ -105,6 +105,9 @@ poetry run chesszero viewer                                             # watch 
 17. [Scaling Up & Improvements](17-scaling-and-improvements.md) — bigger nets, tree reuse, resignation, distributed self-play
 18. [Glossary & Further Reading](18-glossary-and-references.md) — every term in one place, plus the seminal papers
 
+### Supplementary & Deep Dives
+- [The Residual Block Deep Dive](Extra/residual-blocks.md) — mechanics, gradient highway derivation, receptive field analysis, and why ResNets fit chess RL
+
 ---
 
 ## The map: course ↔ code

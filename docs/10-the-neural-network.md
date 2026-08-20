@@ -111,6 +111,8 @@ term gives the gradient a direct "highway" back to earlier layers — the deriva
 of `x + f(x)` with respect to `x` always includes a `1`, so the signal never fully
 vanishes no matter how deep the tower is.
 
+> 📖 **Deep Dive:** For a full mathematical derivation of the gradient highway, receptive field growth on the 8×8 board, and why ResNets outperform MLPs/Transformers here, see [Extra: Residual Blocks Deep Dive](Extra/residual-blocks.md).
+
 The activation function throughout is **ReLU** (`max(0, x)`), a cheap
 nonlinearity that lets the network represent complex functions.
 
