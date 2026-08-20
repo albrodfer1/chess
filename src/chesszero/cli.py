@@ -19,6 +19,12 @@ from .replay_buffer import ReplayBuffer
 from .selfplay import play_game
 from .train import train_epochs
 from .viewer import run_viewer
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
 
 
 def _build(config: Config) -> tuple[ChessNet, torch.optim.Optimizer]:
@@ -61,7 +67,7 @@ def cmd_loop(args: argparse.Namespace) -> None:
     if args.iterations:
         config.iterations = args.iterations
 
-    print(f"Device: {config.device} | sims/move: {config.num_simulations} "
+    logging.info(f"Device: {config.device} | sims/move: {config.num_simulations} "
           f"| games/iter: {config.games_per_iteration}")
 
     ckpt_dir = Path(config.checkpoint_dir)
@@ -77,14 +83,14 @@ def cmd_loop(args: argparse.Namespace) -> None:
         if "optimizer_state" in payload:
             optimizer.load_state_dict(payload["optimizer_state"])
         start_iter = payload.get("iteration", 0)
-        print(f"Resumed from {args.resume} at iteration {start_iter}")
+        logging.info(f"Resumed from {args.resume} at iteration {start_iter}")
 
     # Decide which games to record, spread evenly across the whole run.
     total_games = config.iterations * config.games_per_iteration
     sample_set = _evenly_spaced_indices(total_games, args.sample_games)
     games_dir = Path(args.games_dir)
     if sample_set:
-        print(f"Sampling {len(sample_set)} game(s) sparsely across {total_games} "
+        logging.info(f"Sampling {len(sample_set)} game(s) sparsely across {total_games} "
               f"to '{games_dir}/' for the viewer")
     global_index = 0
 
@@ -98,12 +104,12 @@ def cmd_loop(args: argparse.Namespace) -> None:
             if global_index in sample_set:
                 examples, record = play_game(evaluator, config, record=True)
                 path = _save_game(games_dir, global_index, iteration + 1, record)
-                print(f"  [iter {iteration}] self-play game {g + 1}/"
+                logging.info(f"  [iter {iteration}] self-play game {g + 1}/"
                       f"{config.games_per_iteration}: {len(examples)} positions "
                       f"(saved -> {path})", flush=True)
             else:
                 examples = play_game(evaluator, config)
-                print(f"  [iter {iteration}] self-play game {g + 1}/"
+                logging.info(f"  [iter {iteration}] self-play game {g + 1}/"
                       f"{config.games_per_iteration}: {len(examples)} positions", flush=True)
             buffer.add(examples)
             new_examples += len(examples)
@@ -116,7 +122,7 @@ def cmd_loop(args: argparse.Namespace) -> None:
         save_checkpoint(ckpt_dir / "latest.pt", net, config, optimizer, iteration=iteration + 1)
 
         dt = time.time() - t0
-        print(f"[iter {iteration}] positions+{new_examples} buffer={len(buffer)} "
+        logging.info(f"[iter {iteration}] positions+{new_examples} buffer={len(buffer)} "
               f"policy_loss={stats['policy_loss']:.4f} value_loss={stats['value_loss']:.4f} "
               f"time={dt:.1f}s -> {ckpt_path}", flush=True)
 
@@ -165,7 +171,7 @@ def _read_human_move(board: chess.Board) -> chess.Move | None:
                 move = None
         if move is not None and move in board.legal_moves:
             return move
-        print("Illegal or unparseable move; try again.")
+        logging.info("Illegal or unparseable move; try again.")
 
 
 def cmd_eval(args: argparse.Namespace) -> None:
