@@ -36,6 +36,7 @@ class Config:
     # --- Self-play ---
     max_moves: int = 200
     temperature_moves: int = 30   # sample proportional to visits for first N plies
+    temperature_low: float = 0.2  # low temperature value to play after temperature_moves
     games_per_iteration: int = 20
     selfplay_batch_size: int = 16  # games run concurrently with batched NN eval
 
