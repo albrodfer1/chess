@@ -20,31 +20,56 @@ from .network import ChessNet
 
 
 class Evaluator:
-    """Wraps the network to score a single board with a legal-masked policy."""
+    """Wraps the network to score boards with a legal-masked policy.
+
+    ``evaluate_many`` runs a *single batched* forward pass over many boards,
+    which is the whole point of batched self-play: on a GPU one forward pass
+    over N positions is far cheaper than N passes of one position each (the
+    latter is latency-bound by kernel launches and GPU<->CPU syncs).
+    """
 
     def __init__(self, net: ChessNet, device: str) -> None:
         self.net = net
         self.device = device
 
     @torch.no_grad()
+    def evaluate_many(
+        self, boards: list[chess.Board]
+    ) -> list[tuple[dict[chess.Move, float], float]]:
+        """Batched ``evaluate``: one forward pass for all ``boards``.
+
+        Returns a list aligned with ``boards`` of ``({legal_move: prior}, value)``.
+        """
+        if not boards:
+            return []
+
+        arr = np.stack([encode_board(b) for b in boards])
+        x = torch.from_numpy(arr).to(self.device)
+        logits, values = self.net(x)
+        logits = logits.cpu().numpy()
+        values = values.cpu().numpy()
+
+        results: list[tuple[dict[chess.Move, float], float]] = []
+        for i, board in enumerate(boards):
+            value = float(values[i])
+            moves = list(board.legal_moves)
+            if not moves:
+                results.append(({}, value))
+                continue
+
+            indices = np.fromiter((move_to_index(m) for m in moves), dtype=np.int64)
+            move_logits = logits[i][indices]
+            # Softmax over legal moves only -> illegal moves get zero probability.
+            move_logits -= move_logits.max()
+            priors = np.exp(move_logits)
+            priors /= priors.sum()
+            results.append(({m: float(p) for m, p in zip(moves, priors)}, value))
+
+        return results
+
     def evaluate(self, board: chess.Board) -> tuple[dict[chess.Move, float], float]:
-        """Return ({legal_move: prior_prob}, value_for_side_to_move)."""
-        x = torch.from_numpy(encode_board(board)).unsqueeze(0).to(self.device)
-        logits, value = self.net(x)
-        logits = logits[0].cpu().numpy()
-
-        moves = list(board.legal_moves)
-        if not moves:
-            return {}, float(value.item())
-
-        indices = np.fromiter((move_to_index(m) for m in moves), dtype=np.int64)
-        move_logits = logits[indices]
-        # Softmax over legal moves only -> illegal moves get zero probability.
-        move_logits -= move_logits.max()
-        priors = np.exp(move_logits)
-        priors /= priors.sum()
-
-        return {m: float(p) for m, p in zip(moves, priors)}, float(value.item())
+        """Score a single board (a batch-of-one ``evaluate_many``)."""
+        return self.evaluate_many([board])[0]
 
 
 class Node:
@@ -123,44 +148,67 @@ def _add_dirichlet_noise(root: Node, config: Config) -> None:
         child.prior = (1 - eps) * child.prior + eps * float(n)
 
 
+def run_mcts_batch(boards: list[chess.Board], evaluator: Evaluator, config: Config,
+                   add_noise: bool = False) -> list[Node]:
+    """Run an independent MCTS per board, in lockstep, batching all NN calls.
+
+    Each board gets its own search tree; the trees never interact. The only
+    thing shared is the network evaluation: at every simulation step we gather
+    the leaf reached in *each* tree and score them all in one batched forward
+    pass. That turns ``N`` separate evaluations into one, which is where the
+    GPU speedup comes from. Returns one expanded root per input board.
+    """
+    roots = [Node(prior=0.0) for _ in boards]
+    for root, board in zip(roots, boards):
+        root.board = board.copy()
+
+    # Expand every root from a single batched evaluation.
+    for root, (priors, _) in zip(roots, evaluator.evaluate_many([r.board for r in roots])):
+        _expand(root, priors)
+        if add_noise and root.children:
+            _add_dirichlet_noise(root, config)
+
+    for _ in range(config.num_simulations):
+        # Selection: descend each tree to a leaf, materializing its board.
+        leaves: list[Node] = []
+        paths: list[list[Node]] = []
+        for root in roots:
+            node = root
+            path = [root]
+            while node.expanded:
+                node = _select_child(node, config.c_puct)
+                path.append(node)
+            if node.board is None:
+                node.board = node.parent.board.copy()
+                node.board.push(node.move)
+            leaves.append(node)
+            paths.append(path)
+
+        # Evaluation: exact value for terminal leaves, one batched forward pass
+        # for the rest.
+        terminal = [is_terminal(node.board) for node in leaves]
+        pending = [node.board for node, term in zip(leaves, terminal) if not term]
+        evals = iter(evaluator.evaluate_many(pending))
+
+        # Backup: alternate sign each ply back up each tree.
+        for node, term, path in zip(leaves, terminal, paths):
+            if term:
+                value = terminal_value(node.board)
+            else:
+                priors, value = next(evals)
+                _expand(node, priors)
+            for path_node in reversed(path):
+                path_node.visit_count += 1
+                path_node.value_sum += value
+                value = -value
+
+    return roots
+
+
 def run_mcts(board: chess.Board, evaluator: Evaluator, config: Config,
              add_noise: bool = False) -> Node:
     """Run simulations from `board` and return the (expanded) root node."""
-    root = Node(prior=0.0)
-    root.board = board.copy()
-
-    priors, _ = evaluator.evaluate(root.board)
-    _expand(root, priors)
-    if add_noise and root.children:
-        _add_dirichlet_noise(root, config)
-
-    for _ in range(config.num_simulations):
-        node = root
-        search_path = [root]
-
-        # Selection: descend until we reach an unexpanded node.
-        while node.expanded:
-            node = _select_child(node, config.c_puct)
-            search_path.append(node)
-
-        # Lazily materialize the board for the reached leaf.
-        if node.board is None:
-            node.board = node.parent.board.copy()
-            node.board.push(node.move)
-
-        if is_terminal(node.board):
-            value = terminal_value(node.board)
-        else:
-            priors, value = evaluator.evaluate(node.board)
-            _expand(node, priors)
-
-        # Backup: alternate sign each ply back up the tree.
-        for path_node in reversed(search_path):
-            path_node.visit_count += 1
-            path_node.value_sum += value
-            value = -value
-
-    return root
+    return run_mcts_batch([board], evaluator, config, add_noise=add_noise)[0]
 
 
 def policy_from_visits(root: Node, temperature: float = 1.0) -> np.ndarray:

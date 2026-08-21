@@ -53,6 +53,14 @@ replay_buffer_size: int = 50_000
 
 More games per iteration and more iterations mean more, fresher experience. A larger `replay_buffer_size` remembers more history and fights forgetting ([Chapter 16](16-debugging-and-convergence.md)), at the cost of RAM and slightly staler data.
 
+### Self-play throughput
+
+```python
+selfplay_batch_size: int = 16   # games run concurrently, with batched NN eval
+```
+
+`selfplay_batch_size` controls how many self-play games run **at once**, pooling their MCTS evaluations into single network forward passes (this is the batched self-play of [Chapter 12](12-self-play-in-code.md), improvement (b) below). It doesn't change *what* is learned — only how fast games are generated. On a GPU, raise it (32–64+) until the device is saturated or you run out of memory; on CPU the gains are modest. Exposed on the loop as `--parallel-games`.
+
 ### Optimization — how the network digests that data
 
 ```python
@@ -97,15 +105,18 @@ But the subtree under the move you actually played is *already searched* — aft
 
 **Improvement:** carry the tree across moves. After `select_move` picks `m`, keep `root.children[m]` as the new root (detach its `parent`, and re-add Dirichlet noise at the new root for self-play). This is a change to the *caller* — `play_game` in [`selfplay.py`](../src/chesszero/selfplay.py) and `MCTSAgent.choose_move` in [`agent.py`](../src/chesszero/agent.py) — plus a small helper in `mcts.py` that runs additional simulations on an existing root instead of always creating one. Payoff: often a large fraction of simulations are reused, effectively increasing search depth for free.
 
-### (b) Batched / parallel leaf evaluation
+### (b) Batched / parallel leaf evaluation — ✅ implemented
 
-**Today:** `Evaluator.evaluate` runs the network on **one** board at a time (`unsqueeze(0)` makes a batch of size 1). On a GPU that leaves most of the hardware idle.
+**Was:** `Evaluator.evaluate` ran the network on **one** board at a time (`unsqueeze(0)` makes a batch of size 1), leaving a GPU mostly idle — a GPU↔CPU sync per simulation.
 
-**Improvement:** evaluate many leaves per network call. Two common approaches:
-- **Parallel self-play games** on one process, batching the leaf boards that are waiting for evaluation across games into a single forward pass.
-- **Virtual loss** within a single tree, letting several simulations descend to different leaves before a batched evaluation, then backing them up together.
+**Now:** self-play is batched end to end (walked through in [Chapter 12 §12.6](12-self-play-in-code.md)). Three pieces in [`mcts.py`](../src/chesszero/mcts.py) and [`selfplay.py`](../src/chesszero/selfplay.py):
+- `Evaluator.evaluate_many` scores a *list* of boards in one forward pass (`evaluate` is now a batch-of-one wrapper).
+- `run_mcts_batch` runs an independent tree per board and pools every simulation's leaves into a single evaluation; `run_mcts` delegates to it. Batching leaves the search itself unchanged — verified identical to per-board search in the tests.
+- `play_games_batch` keeps a **refill pool** of `selfplay_batch_size` games in flight, starting a fresh game as each finishes, so the batch stays full despite wildly varying game lengths.
 
-This is the highest-leverage change for GPU throughput. It touches `Evaluator` (accept a list of boards, return a list of `(priors, value)`) and `run_mcts` (collect a batch of leaves before evaluating). It's more invasive, but self-play is where nearly all the time goes, so it pays off the most.
+`cmd_loop` uses this path, tuned with `--parallel-games` (see `selfplay_batch_size` in §17.2). Measured ~2× on CPU; far more on a GPU, which is the point.
+
+**Still on the table:** *virtual loss* within a single tree — letting several simulations of the *same* search descend to different leaves before a batched evaluation, then backing them up together. That would batch a lone game's search too, complementing the cross-game batching above (useful for interactive play, where only one game is running).
 
 ### (c) Perspective / mirrored board encoding
 
@@ -160,7 +171,7 @@ Roughly, in decreasing strength-per-effort for a laptop/single-GPU setup:
 | Improvement | Effort | Payoff | Why |
 | --- | --- | --- | --- |
 | Raise `num_simulations` + `iterations` | trivial (config) | high | direct strength; no code |
-| (b) Batched leaf evaluation | high | very high | unlocks the GPU; self-play is the bottleneck |
+| (b) Batched leaf evaluation | ✅ done | very high | unlocks the GPU; self-play is the bottleneck |
 | (a) Tree reuse | medium | high | free extra search depth every move |
 | (c) Perspective encoding | medium | high | ~2× sample efficiency |
 | (e) Arena gating | medium | medium–high | prevents regressions / forgetting |
@@ -168,14 +179,14 @@ Roughly, in decreasing strength-per-effort for a laptop/single-GPU setup:
 | (h) Persist buffer / PGN | low | medium | continuity + inspectability |
 | (f) LR schedule, (g) exploration tuning | low | small–medium | stability and diversity |
 
-Start with the config knobs (§17.2) to confirm the pipeline strengthens at all, then invest in batched evaluation and tree reuse to make each hour of compute count.
+Start with the config knobs (§17.2) to confirm the pipeline strengthens at all. Batched evaluation (b) is already in place — turn it up with `--parallel-games` on a GPU — so the next big win to build is tree reuse (a).
 
 ---
 
 ## Key takeaways
 
 - Chess demands scale; our defaults are laptop-sized on purpose. Strength comes from the **product** of capacity (`num_res_blocks`, `num_filters`), search (`num_simulations`), and data (`games_per_iteration`, `iterations`, `replay_buffer_size`).
-- **Self-play is the bottleneck**, so the highest-leverage engineering wins are **batched leaf evaluation** (use the GPU) and **tree reuse** (stop throwing away searched subtrees).
+- **Self-play is the bottleneck**, so the highest-leverage engineering wins target it: **batched leaf evaluation** (now implemented — `--parallel-games` pools many games' evaluations into one forward pass to use the GPU) and **tree reuse** (still to build — stop throwing away searched subtrees).
 - **Perspective encoding** roughly doubles sample efficiency; the only reason it isn't in the code is the care needed to mirror the action mapping.
 - **Arena gating** and a larger replay buffer defend against regression and forgetting; **resignation/adjudication** make games cheaper and the value signal cleaner.
 - Several upgrades are nearly free because the hooks already exist — `ReplayBuffer.save/load` just needs wiring into `cmd_loop`, and `_play_match` is ready to power arena gating.

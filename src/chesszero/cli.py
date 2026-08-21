@@ -18,7 +18,7 @@ from .config import Config
 from .mcts import Evaluator
 from .network import ChessNet
 from .replay_buffer import ReplayBuffer
-from .selfplay import play_game
+from .selfplay import play_games_batch
 from .train import train_epochs
 from .viewer import run_viewer
 
@@ -91,13 +91,16 @@ def cmd_loop(args: argparse.Namespace) -> None:
         config.games_per_iteration = args.games
     if args.iterations:
         config.iterations = args.iterations
+    if args.parallel_games:
+        config.selfplay_batch_size = args.parallel_games
 
     # Reproducibility: refuse to train on a dirty tree, and namespace every
     # artifact of this run by the commit it was trained at.
     git_hash = _require_clean_worktree()
 
     print(f"Device: {config.device} | sims/move: {config.num_simulations} "
-          f"| games/iter: {config.games_per_iteration} | git: {git_hash}")
+          f"| games/iter: {config.games_per_iteration} "
+          f"| parallel: {config.selfplay_batch_size} | git: {git_hash}")
 
     net, optimizer = _build(config)
     buffer = ReplayBuffer(config.replay_buffer_size)
@@ -114,6 +117,10 @@ def cmd_loop(args: argparse.Namespace) -> None:
         print(f"Resumed from {args.resume} at iteration {start_iter}")
 
     # Per-commit output folders + a config.json recording exactly what we ran.
+    # (--checkpoint-dir wins even on --resume, so training can be redirected to
+    # e.g. a mounted Google Drive folder.)
+    if args.checkpoint_dir:
+        config.checkpoint_dir = args.checkpoint_dir
     ckpt_dir = Path(config.checkpoint_dir) / git_hash
     games_dir = Path(args.games_dir) / git_hash
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -139,10 +146,14 @@ def cmd_loop(args: argparse.Namespace) -> None:
         new_examples = 0
         outcomes = {"white wins": 0, "black wins": 0, "draw": 0}
         reasons: dict[str, int] = {}
-        for g in range(config.games_per_iteration):
-            record_this = global_index in sample_set
-            examples, info = play_game(evaluator, config, record=record_this)
 
+        base_index = global_index
+        record_indices = {g for g in range(config.games_per_iteration)
+                          if base_index + g in sample_set}
+
+        def on_game_done(g: int, examples, info) -> None:
+            nonlocal new_examples
+            global_idx = base_index + g
             outcomes[info["winner"]] += 1
             reasons[info["termination"]] = reasons.get(info["termination"], 0) + 1
 
@@ -150,14 +161,20 @@ def cmd_loop(args: argparse.Namespace) -> None:
                     f"{config.games_per_iteration}: {len(examples)} positions "
                     f"| {info['winner']} ({info['termination']}) "
                     f"in {info['num_plies']} plies")
-            if record_this:
-                path = _save_game(games_dir, global_index, iteration + 1, info)
+            if global_idx in sample_set:
+                path = _save_game(games_dir, global_idx, iteration + 1, info)
                 line += f" (saved -> {path})"
             print(line, flush=True)
 
             buffer.add(examples)
             new_examples += len(examples)
-            global_index += 1
+
+        play_games_batch(evaluator, config,
+                         num_games=config.games_per_iteration,
+                         batch_size=config.selfplay_batch_size,
+                         record_indices=record_indices,
+                         on_game_done=on_game_done)
+        global_index = base_index + config.games_per_iteration
 
         reason_str = ", ".join(f"{n} {r}" for r, n in sorted(reasons.items()))
         print(f"  [iter {iteration}] results: "
@@ -288,12 +305,18 @@ def main(argv: list[str] | None = None) -> None:
     p_loop.add_argument("--iterations", type=int, default=0)
     p_loop.add_argument("--games", type=int, default=0, help="self-play games per iteration")
     p_loop.add_argument("--simulations", type=int, default=0, help="MCTS sims per move")
+    p_loop.add_argument("--parallel-games", type=int, default=0,
+                        help="self-play games to run concurrently with batched "
+                             "NN evaluation (bigger = better GPU utilization)")
     p_loop.add_argument("--resume", default="", help="checkpoint path to resume from")
     p_loop.add_argument("--sample-games", type=int, default=0,
                         help="save this many games, spread evenly across the run "
                              "(e.g. 10), for the viewer")
     p_loop.add_argument("--games-dir", default="games",
                         help="directory to write sampled game JSON files")
+    p_loop.add_argument("--checkpoint-dir", default="",
+                        help="directory for checkpoints (e.g. a mounted Google "
+                             "Drive folder); overrides the config default")
     p_loop.set_defaults(func=cmd_loop)
 
     p_play = sub.add_parser("play", help="play against a trained model")
