@@ -37,6 +37,7 @@ class Config:
     max_moves: int = 200
     temperature_moves: int = 30   # sample proportional to visits for first N plies
     games_per_iteration: int = 20
+    selfplay_batch_size: int = 16  # games run concurrently with batched NN eval
 
     # --- Training ---
     batch_size: int = 256

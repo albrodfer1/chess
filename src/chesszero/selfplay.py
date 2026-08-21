@@ -6,8 +6,97 @@ import chess
 
 from .config import Config
 from .encoding import encode_board
-from .mcts import Evaluator, is_terminal, policy_from_visits, run_mcts, select_move
+from .mcts import (
+    Evaluator,
+    is_terminal,
+    policy_from_visits,
+    run_mcts,
+    run_mcts_batch,
+    select_move,
+)
 from .replay_buffer import Example
+
+
+class _SelfPlayGame:
+    """Mutable state for one in-progress self-play game.
+
+    Holds everything a game accumulates as it is stepped ply by ply, so that
+    many games can be driven together (batched self-play) without tangling
+    their state.
+    """
+
+    def __init__(self, record: bool = False) -> None:
+        self.board = chess.Board()
+        self.history: list[tuple] = []   # (state, policy, side_to_move)
+        self.ply_records: list[dict] = []
+        self.move_number = 0
+        self.record = record
+        self.done = False
+
+
+def _advance_game(game: _SelfPlayGame, root, evaluator: Evaluator,
+                  config: Config) -> None:
+    """Play one ply of ``game`` from its already-searched ``root``.
+
+    Records the search policy, samples/greedy-picks a move (temperature early,
+    greedy later), pushes it, and marks the game done on a terminal position or
+    the move cap.
+    """
+    if not root.children:
+        game.done = True
+        return
+
+    temperature = 1.0 if game.move_number < config.temperature_moves else 0.0
+    policy = policy_from_visits(root, temperature=1.0)
+    game.history.append((encode_board(game.board), policy, game.board.turn))
+
+    move = select_move(root, temperature=temperature)
+    if game.record:
+        game.ply_records.append(
+            _record_ply(game.board, root, move, evaluator, game.move_number)
+        )
+
+    game.board.push(move)
+    game.move_number += 1
+    if is_terminal(game.board) or game.move_number >= config.max_moves:
+        game.done = True
+
+
+def _finalize_game(game: _SelfPlayGame, config: Config):
+    """Turn a finished game into ``(examples, info)`` (see ``play_game``)."""
+    board = game.board
+    result = _game_result(board)  # +1 white win, -1 black win, 0 draw/unfinished
+
+    examples: list[Example] = []
+    for state, policy, side_to_move in game.history:
+        value = result if side_to_move == chess.WHITE else -result
+        examples.append(Example(state=state, policy=policy, value=float(value)))
+
+    info = {
+        "result": result,                 # +1 / 0 / -1 (white perspective)
+        "winner": _winner_str(result),
+        "result_str": board.result(claim_draw=True),
+        "num_plies": game.move_number,
+        "termination": _termination_reason(board, game.move_number, config),
+    }
+
+    if not game.record:
+        return examples, info
+
+    # Append the final position so the viewer can show the finished board.
+    game.ply_records.append({
+        "ply": game.move_number,
+        "fen": board.fen(),
+        "turn": "white" if board.turn == chess.WHITE else "black",
+        "played": None,
+        "value": None,
+        "mcts_value": None,
+        "evaluations": [],
+        "terminal": True,
+    })
+
+    info["moves"] = game.ply_records
+    return examples, info
 
 
 def play_game(evaluator: Evaluator, config: Config, record: bool = False):
@@ -28,60 +117,62 @@ def play_game(evaluator: Evaluator, config: Config, record: bool = False):
     per-ply data (FEN, the move played, the network value, and the softmax
     evaluation of every legal move) suitable for the browser viewer.
     """
-    board = chess.Board()
-    history: list[tuple] = []  # (state, policy, side_to_move)
-    ply_records: list[dict] = []
+    game = _SelfPlayGame(record=record)
+    while not game.done:
+        root = run_mcts(game.board, evaluator, config, add_noise=True)
+        _advance_game(game, root, evaluator, config)
+    return _finalize_game(game, config)
 
-    move_number = 0
-    while not is_terminal(board) and move_number < config.max_moves:
-        root = run_mcts(board, evaluator, config, add_noise=True)
-        if not root.children:
-            break
 
-        temperature = 1.0 if move_number < config.temperature_moves else 0.0
-        policy = policy_from_visits(root, temperature=1.0)
-        history.append((encode_board(board), policy, board.turn))
+def play_games_batch(evaluator: Evaluator, config: Config, num_games: int,
+                     batch_size: int | None = None,
+                     record_indices: set[int] | None = None,
+                     on_game_done=None):
+    """Generate ``num_games`` self-play games with batched network evaluation.
 
-        move = select_move(root, temperature=temperature)
+    Up to ``batch_size`` games are kept in flight at once and stepped in
+    lockstep, so all their MCTS evaluations batch into single forward passes.
+    A finished game is immediately replaced by a fresh one until ``num_games``
+    have been played — this "refill pool" keeps the batch (and the GPU) full
+    even though chess games vary a lot in length.
 
-        if record:
-            ply_records.append(_record_ply(board, root, move, evaluator, move_number))
+    Returns a list of ``(examples, info)`` in game-start order. If
+    ``on_game_done`` is given it is called as ``on_game_done(index, examples,
+    info)`` the moment each game finishes (finish order, not start order), which
+    the training loop uses for live logging.
+    """
+    record_indices = record_indices or set()
+    batch_size = batch_size or num_games
+    batch_size = max(1, min(batch_size, num_games))
 
-        board.push(move)
-        move_number += 1
+    results: list = [None] * num_games
+    active: list[tuple[int, _SelfPlayGame]] = []
+    next_start = 0
 
-    result = _game_result(board)  # +1 white win, -1 black win, 0 draw/unfinished
+    def refill() -> None:
+        nonlocal next_start
+        while next_start < num_games and len(active) < batch_size:
+            active.append(
+                (next_start, _SelfPlayGame(record=next_start in record_indices))
+            )
+            next_start += 1
 
-    examples: list[Example] = []
-    for state, policy, side_to_move in history:
-        value = result if side_to_move == chess.WHITE else -result
-        examples.append(Example(state=state, policy=policy, value=float(value)))
+    refill()
+    while active:
+        roots = run_mcts_batch([g.board for _, g in active], evaluator, config,
+                               add_noise=True)
+        for (index, game), root in zip(active, roots):
+            _advance_game(game, root, evaluator, config)
+            if game.done:
+                results[index] = _finalize_game(game, config)
+                if on_game_done is not None:
+                    on_game_done(index, *results[index])
 
-    info = {
-        "result": result,                 # +1 / 0 / -1 (white perspective)
-        "winner": _winner_str(result),
-        "result_str": board.result(claim_draw=True),
-        "num_plies": move_number,
-        "termination": _termination_reason(board, move_number, config),
-    }
+        if any(game.done for _, game in active):
+            active = [(i, g) for i, g in active if not g.done]
+            refill()
 
-    if not record:
-        return examples, info
-
-    # Append the final position so the viewer can show the finished board.
-    ply_records.append({
-        "ply": move_number,
-        "fen": board.fen(),
-        "turn": "white" if board.turn == chess.WHITE else "black",
-        "played": None,
-        "value": None,
-        "mcts_value": None,
-        "evaluations": [],
-        "terminal": True,
-    })
-
-    info["moves"] = ply_records
-    return examples, info
+    return results
 
 
 def _record_ply(board: chess.Board, root, move: chess.Move,
