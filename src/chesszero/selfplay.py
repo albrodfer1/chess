@@ -46,7 +46,7 @@ def _advance_game(game: _SelfPlayGame, root, evaluator: Evaluator,
         game.done = True
         return
 
-    temperature = 1.0 if game.move_number < config.temperature_moves else 0.0
+    temperature = 1.0 if game.move_number < config.temperature_moves else config.temperature_low
     policy = policy_from_visits(root, temperature=1.0)
     game.history.append((encode_board(game.board), policy, game.board.turn))
 
