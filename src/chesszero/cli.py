@@ -117,6 +117,10 @@ def cmd_loop(args: argparse.Namespace) -> None:
         print(f"Resumed from {args.resume} at iteration {start_iter}")
 
     # Per-commit output folders + a config.json recording exactly what we ran.
+    # (--checkpoint-dir wins even on --resume, so training can be redirected to
+    # e.g. a mounted Google Drive folder.)
+    if args.checkpoint_dir:
+        config.checkpoint_dir = args.checkpoint_dir
     ckpt_dir = Path(config.checkpoint_dir) / git_hash
     games_dir = Path(args.games_dir) / git_hash
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -310,6 +314,9 @@ def main(argv: list[str] | None = None) -> None:
                              "(e.g. 10), for the viewer")
     p_loop.add_argument("--games-dir", default="games",
                         help="directory to write sampled game JSON files")
+    p_loop.add_argument("--checkpoint-dir", default="",
+                        help="directory for checkpoints (e.g. a mounted Google "
+                             "Drive folder); overrides the config default")
     p_loop.set_defaults(func=cmd_loop)
 
     p_play = sub.add_parser("play", help="play against a trained model")
