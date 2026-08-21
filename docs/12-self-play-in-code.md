@@ -8,6 +8,7 @@
 - Why MCTS runs on *every* move but the reward only arrives at the *end* — and how we assign that reward backward to every position
 - The temperature schedule that balances exploration and strength
 - Why games are *guaranteed* to end, and the `record=True` path that feeds the viewer
+- How **batched self-play** runs many games at once so one GPU forward pass evaluates many positions
 
 ---
 
@@ -370,7 +371,121 @@ recorded only for a *sparsely sampled* subset (10 by default, spread across
 training), not for every game. The sampling logic lives in the training loop and
 is covered in [Chapter 14](14-the-reinforcement-loop.md).
 
-## 12.6 How examples flow onward
+## 12.6 Generating many games at once (batched self-play)
+
+Everything so far played **one game at a time**, and inside each game MCTS
+evaluates **one position per simulation** — `Evaluator.evaluate` does an
+`unsqueeze(0)`, a batch of size *one*. That's fine on a CPU, but it leaves a GPU
+almost entirely idle: a GPU is built to run hundreds of positions in parallel, and
+a batch of one is dominated by the fixed cost of launching the work and copying the
+result back (a GPU↔CPU sync *every* simulation). Since **self-play is the training
+bottleneck** ([Chapter 17](17-scaling-and-improvements.md)), this is the first
+thing worth speeding up.
+
+The fix is to **run many games concurrently and evaluate their positions
+together**. It comes in three layers, bottom to top.
+
+### Layer 1 — a batched evaluator
+
+`Evaluator.evaluate_many` scores a *list* of boards in a single forward pass, and
+`evaluate` becomes a one-element wrapper around it:
+
+```python
+@torch.no_grad()
+def evaluate_many(self, boards):
+    arr = np.stack([encode_board(b) for b in boards])   # (N, planes, 8, 8)
+    x = torch.from_numpy(arr).to(self.device)
+    logits, values = self.net(x)                        # ONE forward pass for all N
+    ...                                                 # per-board legal-move softmax
+    return results                                      # list of ({move: prior}, value)
+
+def evaluate(self, board):
+    return self.evaluate_many([board])[0]
+```
+
+One `self.net(x)` call now covers `N` positions instead of one — the difference
+between a few percent GPU utilization and a full device.
+
+### Layer 2 — batched search across trees
+
+`run_mcts_batch` runs an **independent MCTS for each board**, but steps them in
+lockstep so their evaluations can be pooled. Each simulation descends *every* tree
+to a leaf, collects those leaves, and scores them all with one `evaluate_many`
+call:
+
+```python
+for _ in range(config.num_simulations):
+    leaves, paths = [], []
+    for root in roots:                       # descend EACH tree to its leaf
+        node, path = root, [root]
+        while node.expanded:
+            node = _select_child(node, config.c_puct); path.append(node)
+        ...
+        leaves.append(node); paths.append(path)
+
+    pending = [n.board for n, term in zip(leaves, terminal) if not term]
+    evals = iter(evaluator.evaluate_many(pending))   # ONE batched call for all trees
+    ...                                              # expand + back up each tree as before
+```
+
+The trees never interact — the *only* thing shared is the batched network call.
+`run_mcts` is now simply `run_mcts_batch([board])[0]`, so there is a single code
+path.
+
+📐 **This changes nothing about the search itself.** Batching only groups the
+neural-network calls; each game's PUCT selection, expansion, and backup are exactly
+what [Chapter 11](11-mcts-in-code.md) described. With Dirichlet noise off,
+`run_mcts_batch([b, b])` produces two *identical* trees, bit-for-bit equal to
+`run_mcts(b)` — this is checked in the tests.
+
+### Layer 3 — a refill pool of games
+
+`play_games_batch` drives whole games. The wrinkle is that **chess games vary
+enormously in length** — a quick mate in 20 plies next to a 200-ply grind (you saw
+exactly this in the training logs). If we launched a fixed block of games and waited
+for all of them, the batch would collapse to a single straggler at the end, wasting
+the GPU. So instead we keep a **pool** of `selfplay_batch_size` games in flight and
+start a fresh game the instant one finishes:
+
+```
+ selfplay_batch_size = 4,  num_games = 8
+
+ slot ┌ g0───────────done → g4────────done → g7──────done
+      │ g1──done → g5──────────────────────done
+      │ g2───────────────done → g6──────done
+      └ g3──done → (pool drains as the last games finish)
+        └────────── always ~4 games searching at once ──────────┘
+```
+
+Each outer step runs one batched search over the *active* games' current positions,
+plays one ply in each, finalizes any that ended, and refills the empty slots.
+Results come back in game-start order; an optional `on_game_done` callback fires as
+each game finishes so the training loop can log live.
+
+### Using it
+
+The knob is `config.selfplay_batch_size` (default 16), exposed on the training loop
+as `--parallel-games`:
+
+```bash
+chesszero --device cuda loop --parallel-games 32 --simulations 200 ...
+```
+
+Bigger batches use the GPU better, up to the point where you run out of memory or
+active games. Even on CPU it's roughly **2× faster** (it amortizes Python/PyTorch
+dispatch overhead); on a GPU the speedup is far larger, which is the whole point.
+
+⚠️ **Two behavioural notes.** (1) Because games run concurrently and finish at
+different times, the per-game log lines now appear in **finish order**, not start
+order — the `game k/N` label is the start index. (2) Dirichlet noise is drawn in a
+different order than sequential play, so a batched run isn't bit-identical to a
+sequential one — but it's the same algorithm sampling from the same distribution,
+so the training data is equivalent.
+
+This is improvement **(b)** from [Chapter 17](17-scaling-and-improvements.md), now
+built in.
+
+## 12.7 How examples flow onward
 
 `play_game` returns a list of `Example` objects (defined in
 [`replay_buffer.py`](../src/chesszero/replay_buffer.py)):
@@ -411,6 +526,11 @@ what the network *does* with it.
 - **`record=True`** captures rich per-ply data (clean policy softmax, network vs
   MCTS value, top moves) for the browser viewer — at extra cost, so only sampled
   games are recorded.
+- **Batched self-play** (`evaluate_many` → `run_mcts_batch` → `play_games_batch`)
+  runs many games concurrently and pools their network calls into single forward
+  passes, with a refill pool keeping the batch full despite varying game lengths.
+  It's the main lever for using a GPU (`--parallel-games`) and doesn't change *what*
+  is learned — only how fast games are generated.
 
 ## Exercises
 
@@ -427,6 +547,10 @@ what the network *does* with it.
    the priors already stored on the root's children? (Hint: `add_noise=True`.)
 5. Trace what happens if a game reaches `config.max_moves`. What is `result`, what
    is `board.outcome()`, and what `value` do all the positions receive?
+6. In `play_games_batch`, why keep a **refill pool** of games instead of running a
+   fixed block of `selfplay_batch_size` games and waiting for all to finish? (Hint:
+   look at the spread of game lengths in the training logs.) What happens to GPU
+   utilization at the end of a fixed block?
 
 ---
 
