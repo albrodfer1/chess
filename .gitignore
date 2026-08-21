@@ -13,3 +13,6 @@ checkpoints/
 games/
 *.pt
 *.pkl
+
+# Other
+.DS_Store
