@@ -93,6 +93,8 @@ def cmd_loop(args: argparse.Namespace) -> None:
         config.iterations = args.iterations
     if args.parallel_games:
         config.selfplay_batch_size = args.parallel_games
+    if args.buffer_size:
+            config.replay_buffer_size = args.buffer_size
 
     # Reproducibility: refuse to train on a dirty tree, and namespace every
     # artifact of this run by the commit it was trained at.
@@ -317,6 +319,8 @@ def main(argv: list[str] | None = None) -> None:
     p_loop.add_argument("--checkpoint-dir", default="",
                         help="directory for checkpoints (e.g. a mounted Google "
                              "Drive folder); overrides the config default")
+    p_loop.add_argument("--buffer-size", default=50000, type=int,
+                            help="replay buffer size")
     p_loop.set_defaults(func=cmd_loop)
 
     p_play = sub.add_parser("play", help="play against a trained model")
