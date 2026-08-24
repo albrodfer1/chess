@@ -14,19 +14,19 @@ import numpy as np
 # Board encoding
 # ---------------------------------------------------------------------------
 # Plane layout (all 8x8):
-#   0-5   : white pieces  (P, N, B, R, Q, K)
-#   6-11  : black pieces  (P, N, B, R, Q, K)
-#   12    : side to move  (all ones if white to move)
-#   13-16 : castling rights (W kingside, W queenside, B kingside, B queenside)
-#   17    : en-passant target square
-#   18    : halfmove clock, normalized by 100
-#   19    : repetition — current position has occurred at least twice
-#   20    : repetition — current position has occurred at least three times
+#   0-5   : player pieces  (P, N, B, R, Q, K)
+#   6-11  : opponent pieces  (P, N, B, R, Q, K)
+#   12-15 : castling rights (kingside, queenside)
+#   16    : en-passant target square
+#   17    : halfmove clock, normalized by 100
+#   18    : repetition — current position has occurred at least twice
+#   19    : repetition — current position has occurred at least three times
 #
 # The two repetition planes give the network the history it needs to see a
 # threefold-repetition draw coming: without them a single-position encoding is
 # blind to how many times the position has already appeared in the game.
-INPUT_PLANES = 21
+INPUT_PLANES = 20
+PLANES_TO_FLIP = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 16]
 
 # Action space: 73 move "planes" per from-square, 64 from-squares.
 QUEEN_DIRECTIONS = [
@@ -56,36 +56,55 @@ def _piece_plane(color: bool, piece_type: int) -> int:
     """Return the input plane index for a (color, piece_type)."""
     return (piece_type - 1) + (0 if color == chess.WHITE else 6)
 
+def _flip_board(planes):
+    # Invert pieces
+    black_planes = planes[6:12, :, :].copy()
+    planes[6:12, :, :] = planes[0:6, :, :]
+    planes[0:6, :, :] = black_planes.copy()
+
+    # Invert castling rights
+    black_castling = planes[14:16, :, :].copy()
+    planes[14:16, :, :] = planes[12:14, :, :]
+    planes[12:14, :, :] = black_castling.copy()
+    
+    for i in PLANES_TO_FLIP:
+        planes[i, :, :] = _invert_plane(planes[i, :, :])
+    return planes
+
+def _invert_plane(plane):
+    return np.flip(plane)
 
 def encode_board(board: chess.Board) -> np.ndarray:
-    """Encode a board into a (21, 8, 8) float32 tensor (absolute coordinates)."""
+    """Encode a board into a (20, 8, 8) float32 tensor (absolute coordinates)."""
     planes = np.zeros((INPUT_PLANES, 8, 8), dtype=np.float32)
 
     for square, piece in board.piece_map().items():
         rank, file = divmod(square, 8)
         planes[_piece_plane(piece.color, piece.piece_type), rank, file] = 1.0
 
-    if board.turn == chess.WHITE:
-        planes[12, :, :] = 1.0
-
-    planes[13, :, :] = float(board.has_kingside_castling_rights(chess.WHITE))
-    planes[14, :, :] = float(board.has_queenside_castling_rights(chess.WHITE))
-    planes[15, :, :] = float(board.has_kingside_castling_rights(chess.BLACK))
-    planes[16, :, :] = float(board.has_queenside_castling_rights(chess.BLACK))
-
     if board.ep_square is not None:
         rank, file = divmod(board.ep_square, 8)
-        planes[17, rank, file] = 1.0
+        planes[16, rank, file] = 1.0
 
-    planes[18, :, :] = board.halfmove_clock / 100.0
+    planes[12, :, :] = float(board.has_kingside_castling_rights(chess.WHITE))
+    planes[13, :, :] = float(board.has_queenside_castling_rights(chess.WHITE))
+    planes[14, :, :] = float(board.has_kingside_castling_rights(chess.BLACK))
+    planes[15, :, :] = float(board.has_queenside_castling_rights(chess.BLACK))
+
+    if board.turn == chess.BLACK:
+        # Flip the board
+        planes = _flip_board(planes)
+
+
+    planes[17, :, :] = board.halfmove_clock / 100.0
 
     # Repetition counting needs the move stack; boards built by pushing moves
     # (self-play and MCTS copies, which keep their history) carry it, so
     # is_repetition is meaningful here.
     if board.is_repetition(2):
-        planes[19, :, :] = 1.0
+        planes[18, :, :] = 1.0
     if board.is_repetition(3):
-        planes[20, :, :] = 1.0
+        planes[19, :, :] = 1.0
     return planes
 
 
@@ -96,7 +115,7 @@ def _sign(x: int) -> int:
     return (x > 0) - (x < 0)
 
 
-def move_to_index(move: chess.Move) -> int:
+def move_to_index(move: chess.Move, invert=False) -> int:
     """Map a chess.Move to its index in the flat 4672 action space.
 
     Index = plane * 64 + from_square, so it aligns with a (73, 8, 8)
@@ -104,8 +123,18 @@ def move_to_index(move: chess.Move) -> int:
     """
     from_sq = move.from_square
     to_sq = move.to_square
+
     from_rank, from_file = divmod(from_sq, 8)
     to_rank, to_file = divmod(to_sq, 8)
+
+    if invert:
+        from_rank = 7 - from_rank
+        from_file = 7 - from_file
+        to_rank = 7 - to_rank
+        to_file = 7 - to_file
+
+        from_sq = from_rank * 8 + from_file
+
     d_rank = to_rank - from_rank
     d_file = to_file - from_file
 
@@ -134,6 +163,7 @@ def index_to_move(index: int, board: chess.Board) -> chess.Move:
     """
     plane, from_sq = divmod(index, 64)
     from_rank, from_file = divmod(from_sq, 8)
+
     promotion = None
 
     if plane < QUEEN_PLANES:
@@ -152,6 +182,15 @@ def index_to_move(index: int, board: chess.Board) -> chess.Move:
 
     to_rank = from_rank + d_rank
     to_file = from_file + d_file
+
+    if board.turn == chess.BLACK:
+        to_rank = 7 - to_rank
+        to_file = 7 - to_file
+        from_rank = 7 - from_rank
+        from_file = 7 - from_file
+
+        from_sq = from_rank * 8 + from_file
+        
     to_sq = to_rank * 8 + to_file
 
     if promotion is None:
@@ -165,7 +204,7 @@ def index_to_move(index: int, board: chess.Board) -> chess.Move:
 def legal_moves_and_indices(board: chess.Board):
     """Return (list_of_moves, list_of_indices) for all legal moves."""
     moves = list(board.legal_moves)
-    indices = [move_to_index(m) for m in moves]
+    indices = [move_to_index(m, invert = board.turn == chess.BLACK) for m in moves]
     return moves, indices
 
 
@@ -177,5 +216,5 @@ def legal_mask(board: chess.Board) -> np.ndarray:
     """
     mask = np.zeros(ACTION_SIZE, dtype=bool)
     for move in board.legal_moves:
-        mask[move_to_index(move)] = True
+        mask[move_to_index(move, invert = board.turn == chess.BLACK)] = True
     return mask
