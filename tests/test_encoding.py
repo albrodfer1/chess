@@ -1,10 +1,12 @@
 """Round-trip and invariant tests for the encoding layer."""
 
 import chess
+import numpy as np
 
 from chesszero.encoding import (
     ACTION_SIZE,
     INPUT_PLANES,
+    PLANES_TO_FLIP,
     encode_board,
     index_to_move,
     legal_mask,
@@ -27,21 +29,21 @@ def test_repetition_planes():
     board = chess.Board()
     # No repetition yet: both repetition planes are empty.
     planes = encode_board(board)
+    assert not planes[18].any()
     assert not planes[19].any()
-    assert not planes[20].any()
 
     cycle = ["g1f3", "g8f6", "f3g1", "f6g8"]
     for move in cycle:  # one cycle -> starting position seen twice
         board.push_uci(move)
     planes = encode_board(board)
-    assert planes[19].all()       # two-fold: the one-step draw warning
-    assert not planes[20].any()   # not yet three-fold
+    assert planes[18].all()       # two-fold: the one-step draw warning
+    assert not planes[19].any()   # not yet three-fold
 
     for move in cycle:  # second cycle -> seen three times
         board.push_uci(move)
     planes = encode_board(board)
-    assert planes[19].all()
-    assert planes[20].all()       # three-fold
+    assert planes[18].all()
+    assert planes[19].all()       # three-fold
 
 
 def test_move_index_roundtrip_all_legal():
@@ -59,6 +61,50 @@ def test_move_index_roundtrip_all_legal():
             back = index_to_move(idx, board)
             assert back == move, f"{move} -> {idx} -> {back}"
 
+
+def test_black_move_indices_use_inverted_coordinates():
+    """Black moves must share the white-to-move canonical orientation."""
+    board = chess.Board()
+    board.push_uci("e2e4")
+    move = chess.Move.from_uci("e7e5")
+
+    # e7 (6, 4) rotates to d2 (1, 3); its two-square advance is plane 1.
+    index = move_to_index(move, invert=board.turn == chess.BLACK)
+    assert index == 64 + chess.D2
+    assert index_to_move(index, board) == move
+
+    mask = legal_mask(board)
+    assert mask[index]
+
+
+def test_board_is_flipped_correctly():
+    fens = [
+        ("8/2n5/8/8/8/8/PPPPPPPP/RNBQKBNR w - - 10 20", "rnbkqbnr/pppppppp/8/8/8/8/5N2/8 b - - 10 20")
+    ]
+
+    for fen in fens:
+        boardA = chess.Board(fen[0])
+        planesA = encode_board(boardA)
+        boardB = chess.Board(fen[1])
+        planesB = encode_board(boardB)
+
+        for i in PLANES_TO_FLIP:
+
+            if not np.array_equal(planesA[i], planesB[i]):
+                print(f"\nMismatch in plane {i}")
+
+                mask = planesA[i] != planesB[i]
+
+                for row, col in np.argwhere(mask):
+                    print(
+                        f"  position=({row}, {col}): "
+                        f"A={planesA[i, row, col]}, "
+                        f"B={planesB[i, row, col]}"
+                    )
+
+                assert False
+
+    
 
 def test_legal_mask_matches_legal_moves():
     board = chess.Board()
