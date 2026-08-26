@@ -1,8 +1,8 @@
 """Encoding between python-chess objects and neural-network tensors.
 
 This implements the AlphaZero action representation: an 8x8x73 = 4672 flat
-action space, plus a 21-plane board encoding. It also exposes the legal-move
-mask that guarantees the agent can never *select* an illegal move.
+action space, plus a 20-plane canonical board encoding. It also exposes the
+legal-move mask that guarantees the agent can never *select* an illegal move.
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ import numpy as np
 # threefold-repetition draw coming: without them a single-position encoding is
 # blind to how many times the position has already appeared in the game.
 INPUT_PLANES = 20
+LEGACY_INPUT_PLANES = 21
 PLANES_TO_FLIP = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 16]
 
 # Action space: 73 move "planes" per from-square, 64 from-squares.
@@ -73,6 +74,33 @@ def _flip_board(planes):
 
 def _invert_plane(plane):
     return np.flip(plane)
+
+
+def encode_board_legacy(board: chess.Board) -> np.ndarray:
+    """Encode ``board`` using the pre-canonical 21-plane checkpoint format."""
+    planes = np.zeros((LEGACY_INPUT_PLANES, 8, 8), dtype=np.float32)
+
+    for square, piece in board.piece_map().items():
+        rank, file = divmod(square, 8)
+        planes[_piece_plane(piece.color, piece.piece_type), rank, file] = 1.0
+
+    if board.turn == chess.WHITE:
+        planes[12, :, :] = 1.0
+    planes[13, :, :] = float(board.has_kingside_castling_rights(chess.WHITE))
+    planes[14, :, :] = float(board.has_queenside_castling_rights(chess.WHITE))
+    planes[15, :, :] = float(board.has_kingside_castling_rights(chess.BLACK))
+    planes[16, :, :] = float(board.has_queenside_castling_rights(chess.BLACK))
+
+    if board.ep_square is not None:
+        rank, file = divmod(board.ep_square, 8)
+        planes[17, rank, file] = 1.0
+    planes[18, :, :] = board.halfmove_clock / 100.0
+    if board.is_repetition(2):
+        planes[19, :, :] = 1.0
+    if board.is_repetition(3):
+        planes[20, :, :] = 1.0
+    return planes
+
 
 def encode_board(board: chess.Board) -> np.ndarray:
     """Encode a board into a (20, 8, 8) float32 tensor (absolute coordinates)."""

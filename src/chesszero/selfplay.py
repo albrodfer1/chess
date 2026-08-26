@@ -5,7 +5,6 @@ from __future__ import annotations
 import chess
 
 from .config import Config
-from .encoding import encode_board
 from .mcts import (
     Evaluator,
     is_terminal,
@@ -47,8 +46,12 @@ def _advance_game(game: _SelfPlayGame, root, evaluator: Evaluator,
         return
 
     temperature = 1.0 if game.move_number < config.temperature_moves else config.temperature_low
-    policy = policy_from_visits(root, temperature=1.0)
-    game.history.append((encode_board(game.board), policy, game.board.turn))
+    policy = policy_from_visits(
+        root,
+        temperature=1.0,
+        invert=evaluator.canonical and game.board.turn == chess.BLACK,
+    )
+    game.history.append((evaluator.encode(game.board), policy, game.board.turn))
 
     move = select_move(root, temperature=temperature)
     if game.record:

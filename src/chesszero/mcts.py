@@ -15,7 +15,14 @@ import numpy as np
 import torch
 
 from .config import Config
-from .encoding import ACTION_SIZE, encode_board, move_to_index
+from .encoding import (
+    ACTION_SIZE,
+    INPUT_PLANES,
+    LEGACY_INPUT_PLANES,
+    encode_board,
+    encode_board_legacy,
+    move_to_index,
+)
 from .network import ChessNet
 
 
@@ -31,6 +38,19 @@ class Evaluator:
     def __init__(self, net: ChessNet, device: str) -> None:
         self.net = net
         self.device = device
+        self.canonical = net.config.input_planes == INPUT_PLANES
+        if not self.canonical and net.config.input_planes != LEGACY_INPUT_PLANES:
+            raise ValueError(
+                f"unsupported checkpoint input plane count: {net.config.input_planes}"
+            )
+
+    def encode(self, board: chess.Board) -> np.ndarray:
+        """Encode a board in the representation expected by this checkpoint."""
+        return encode_board(board) if self.canonical else encode_board_legacy(board)
+
+    def move_index(self, move: chess.Move, board: chess.Board) -> int:
+        """Return this checkpoint's policy index for a legal move."""
+        return move_to_index(move, invert=self.canonical and board.turn == chess.BLACK)
 
     @torch.no_grad()
     def evaluate_many(
@@ -43,7 +63,7 @@ class Evaluator:
         if not boards:
             return []
 
-        arr = np.stack([encode_board(b) for b in boards])
+        arr = np.stack([self.encode(b) for b in boards])
         x = torch.from_numpy(arr).to(self.device)
         logits, values = self.net(x)
         logits = logits.cpu().numpy()
@@ -57,7 +77,7 @@ class Evaluator:
                 results.append(({}, value))
                 continue
 
-            indices = np.fromiter((move_to_index(m) for m in moves), dtype=np.int64)
+            indices = np.fromiter((self.move_index(m, board) for m in moves), dtype=np.int64)
             move_logits = logits[i][indices]
             # Softmax over legal moves only -> illegal moves get zero probability.
             move_logits -= move_logits.max()
@@ -211,7 +231,8 @@ def run_mcts(board: chess.Board, evaluator: Evaluator, config: Config,
     return run_mcts_batch([board], evaluator, config, add_noise=add_noise)[0]
 
 
-def policy_from_visits(root: Node, temperature: float = 1.0) -> np.ndarray:
+def policy_from_visits(root: Node, temperature: float = 1.0,
+                       invert: bool = False) -> np.ndarray:
     """Build a (4672,) search-policy vector from child visit counts."""
     policy = np.zeros(ACTION_SIZE, dtype=np.float32)
     moves = list(root.children.keys())
@@ -223,13 +244,13 @@ def policy_from_visits(root: Node, temperature: float = 1.0) -> np.ndarray:
     if temperature <= 1e-6:
         # Deterministic: all weight on the most-visited move.
         best = moves[int(visits.argmax())]
-        policy[move_to_index(best)] = 1.0
+        policy[move_to_index(best, invert=invert)] = 1.0
         return policy
 
     scaled = visits ** (1.0 / temperature)
     scaled /= scaled.sum()
     for move, p in zip(moves, scaled):
-        policy[move_to_index(move)] = p
+        policy[move_to_index(move, invert=invert)] = p
     return policy
 
 

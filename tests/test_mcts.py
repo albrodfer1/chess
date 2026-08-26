@@ -33,6 +33,17 @@ def test_mcts_returns_legal_move():
     assert move in board.legal_moves
 
 
+def test_evaluator_supports_legacy_21_plane_checkpoints():
+    config = _tiny_config()
+    config.input_planes = 21
+    evaluator = Evaluator(ChessNet(config), "cpu")
+    board = chess.Board()
+    board.push_uci("e2e4")
+
+    priors, _ = evaluator.evaluate(board)
+    assert set(priors) == set(board.legal_moves)
+
+
 def test_threefold_repetition_is_terminal():
     board = chess.Board()
     # Shuffle both knights out and back: each full cycle repeats the position.
