@@ -24,11 +24,14 @@ class MCTSAgent:
         self.evaluator = Evaluator(net, self.config.device)
 
     def choose_move(self, board: chess.Board, temperature: float = 0.0) -> chess.Move:
+        return select_move(self.search(board), temperature=temperature)
+
+    def search(self, board: chess.Board):
+        """Run MCTS and return its root for move selection or recording."""
         net = self.evaluator.net
         was_training = net.training
         net.eval()
         try:
-            root = run_mcts(board, self.evaluator, self.config, add_noise=False)
+            return run_mcts(board, self.evaluator, self.config, add_noise=False)
         finally:
             net.train(was_training)
-        return select_move(root, temperature=temperature)

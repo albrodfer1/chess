@@ -15,10 +15,10 @@ import torch
 from .agent import MCTSAgent
 from .checkpoint import load_checkpoint, save_checkpoint
 from .config import Config
-from .mcts import Evaluator
+from .mcts import Evaluator, is_terminal, select_move
 from .network import ChessNet
 from .replay_buffer import ReplayBuffer
-from .selfplay import play_games_batch
+from .selfplay import game_record, play_games_batch, record_ply
 from .train import train_epochs
 from .viewer import run_viewer
 
@@ -254,42 +254,73 @@ def cmd_eval(args: argparse.Namespace) -> None:
         net_b.eval()
         agent_b = MCTSAgent(net_b, config_b, simulations=args.simulations or None)
 
+    games_dir = Path(args.record_games_dir) if args.record_games_dir else None
+    if games_dir:
+        print(f"Recording evaluation games to '{games_dir}/' for the viewer")
+
     wins_a = wins_b = draws = 0
     for i in range(args.games):
         a_is_white = i % 2 == 0
-        result = _play_match(agent_a, agent_b, a_is_white, config_a.max_moves)
+        result, record = _play_match(
+            agent_a, agent_b, a_is_white, config_a.max_moves, record=games_dir is not None
+        )
         if result == 0:
             draws += 1
         elif (result == 1) == a_is_white:
             wins_a += 1
         else:
             wins_b += 1
-        print(f"game {i + 1}/{args.games}: A={wins_a} B={wins_b} draws={draws}", flush=True)
+        line = f"game {i + 1}/{args.games}: A={wins_a} B={wins_b} draws={draws}"
+        if games_dir and record is not None:
+            path = _save_game(games_dir, i, 0, record)
+            line += f" (saved -> {path})"
+        print(line, flush=True)
 
     label_b = "model_b" if args.model_b else "random"
     print(f"\nmodel_a wins: {wins_a} | {label_b} wins: {wins_b} | draws: {draws}")
 
 
-def _play_match(agent_a: MCTSAgent, agent_b, a_is_white: bool, max_moves: int) -> float:
+def _play_match(agent_a: MCTSAgent, agent_b, a_is_white: bool, max_moves: int,
+                record: bool = False) -> tuple[float, dict | None]:
     import random
 
     board = chess.Board()
     moves = 0
-    while not board.is_game_over() and moves < max_moves:
+    ply_records = []
+    while not is_terminal(board) and moves < max_moves:
         a_turn = board.turn == (chess.WHITE if a_is_white else chess.BLACK)
-        if a_turn:
-            move = agent_a.choose_move(board, temperature=0.0)
-        elif agent_b is not None:
-            move = agent_b.choose_move(board, temperature=0.0)
+        agent = agent_a if a_turn else agent_b
+        if agent is not None:
+            if record:
+                root = agent.search(board)
+                move = select_move(root, temperature=0.0)
+                ply_records.append(record_ply(board, root, move, agent.evaluator, moves))
+            else:
+                move = agent.choose_move(board, temperature=0.0)
         else:
             move = random.choice(list(board.legal_moves))
+            if record:
+                ply_records.append({
+                    "ply": moves,
+                    "fen": board.fen(),
+                    "turn": "white" if board.turn == chess.WHITE else "black",
+                    "played": {"uci": move.uci(), "san": board.san(move)},
+                    "value": None,
+                    "mcts_value": None,
+                    "evaluations": [],
+                    "terminal": False,
+                })
         board.push(move)
         moves += 1
 
     outcome = board.outcome()
-    if outcome is None or outcome.winner is None:
-        return 0.0
-    return 1.0 if outcome.winner == chess.WHITE else -1.0
+    result = 0.0 if outcome is None or outcome.winner is None else (
+        1.0 if outcome.winner == chess.WHITE else -1.0
+    )
+    if not record:
+        return result, None
+
+    return result, game_record(board, ply_records, moves)
 
 
 def cmd_viewer(args: argparse.Namespace) -> None:
@@ -334,6 +365,8 @@ def main(argv: list[str] | None = None) -> None:
     p_eval.add_argument("--model-b", default="")
     p_eval.add_argument("--games", type=int, default=10)
     p_eval.add_argument("--simulations", type=int, default=0)
+    p_eval.add_argument("--record-games-dir", default="",
+                        help="directory to save evaluation game JSON for the viewer")
     p_eval.set_defaults(func=cmd_eval)
 
     p_view = sub.add_parser("viewer", help="open the browser game viewer")
