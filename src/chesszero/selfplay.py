@@ -53,7 +53,7 @@ def _advance_game(game: _SelfPlayGame, root, evaluator: Evaluator,
     move = select_move(root, temperature=temperature)
     if game.record:
         game.ply_records.append(
-            _record_ply(game.board, root, move, evaluator, game.move_number)
+            record_ply(game.board, root, move, evaluator, game.move_number)
         )
 
     game.board.push(move)
@@ -72,31 +72,12 @@ def _finalize_game(game: _SelfPlayGame, config: Config):
         value = result if side_to_move == chess.WHITE else -result
         examples.append(Example(state=state, policy=policy, value=float(value)))
 
-    info = {
-        "result": result,                 # +1 / 0 / -1 (white perspective)
-        "winner": _winner_str(result),
-        "result_str": board.result(claim_draw=True),
-        "num_plies": game.move_number,
-        "termination": _termination_reason(board, game.move_number, config),
-    }
+    info = game_summary(board, game.move_number)
 
     if not game.record:
         return examples, info
 
-    # Append the final position so the viewer can show the finished board.
-    game.ply_records.append({
-        "ply": game.move_number,
-        "fen": board.fen(),
-        "turn": "white" if board.turn == chess.WHITE else "black",
-        "played": None,
-        "value": None,
-        "mcts_value": None,
-        "evaluations": [],
-        "terminal": True,
-    })
-
-    info["moves"] = game.ply_records
-    return examples, info
+    return examples, game_record(board, game.ply_records, game.move_number)
 
 
 def play_game(evaluator: Evaluator, config: Config, record: bool = False):
@@ -175,8 +156,8 @@ def play_games_batch(evaluator: Evaluator, config: Config, num_games: int,
     return results
 
 
-def _record_ply(board: chess.Board, root, move: chess.Move,
-                evaluator: Evaluator, ply: int) -> dict:
+def record_ply(board: chess.Board, root, move: chess.Move,
+               evaluator: Evaluator, ply: int) -> dict:
     """Capture per-ply data for the viewer.
 
     ``evaluations`` is the raw network policy softmax over legal moves (the
@@ -209,6 +190,33 @@ def _record_ply(board: chess.Board, root, move: chess.Move,
     }
 
 
+def game_summary(board: chess.Board, num_plies: int) -> dict:
+    """Build metadata shared by self-play and evaluation game recordings."""
+    result = _game_result(board)
+    return {
+        "result": result,
+        "winner": _winner_str(result),
+        "result_str": board.result(claim_draw=True),
+        "num_plies": num_plies,
+        "termination": _termination_reason(board),
+    }
+
+
+def game_record(board: chess.Board, ply_records: list[dict], num_plies: int) -> dict:
+    """Finalize viewer-compatible records produced by self-play or evaluation."""
+    final_position = {
+        "ply": num_plies,
+        "fen": board.fen(),
+        "turn": "white" if board.turn == chess.WHITE else "black",
+        "played": None,
+        "value": None,
+        "mcts_value": None,
+        "evaluations": [],
+        "terminal": True,
+    }
+    return {**game_summary(board, num_plies), "moves": [*ply_records, final_position]}
+
+
 def _winner_str(result: float) -> str:
     if result > 0:
         return "white wins"
@@ -217,7 +225,7 @@ def _winner_str(result: float) -> str:
     return "draw"
 
 
-def _termination_reason(board: chess.Board, move_number: int, config: Config) -> str:
+def _termination_reason(board: chess.Board) -> str:
     """Why the game ended, based on the final board (not a claim look-ahead).
 
     If the position isn't terminal under our rules, the loop can only have
